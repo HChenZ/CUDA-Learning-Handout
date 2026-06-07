@@ -276,3 +276,144 @@ int main() {
     return 0;
 }
 ```
+
+---
+
+## 第三阶段：多维线程网格与矩阵运算
+
+在第一部分中，我们处理的都是一维数组。但在科学计算、图像处理和深度学习中，数据往往以二维（如图像、矩阵）或三维（如视频、体数据）的形式存在。CUDA 原生支持一维、二维和三维的线程组织。
+
+### 1. 核心概念：`dim3` 类型与多维索引
+CUDA 提供了一个特殊的三维整型向量类型 `dim3`，用于指定 Grid 和 Block 的维度。未指定的维度默认为 1。
+
+*   **声明方式**：
+    ```cpp
+    dim3 threadsPerBlock(16, 16); // 16x16 的二维线程块（共 256 个线程）
+    dim3 numBlocks((width + 16 - 1) / 16, (height + 16 - 1) / 16); // 二维网格
+    ```
+*   **多维内置变量**：
+    当使用二维布局时，内置变量包含 `.x` 和 `.y` 分量：
+    *   `threadIdx.x` / `threadIdx.y`
+    *   `blockIdx.x` / `blockIdx.y`
+    *   `blockDim.x` / `blockDim.y`
+
+### 2. 二维图像/矩阵的映射逻辑
+在计算机内存中，二维矩阵通常是以**行优先**的一维连续数组形式存储的。为了将 GPU 线程映射到二维矩阵的元素上，我们约定：
+*   **X 维度**对应矩阵的**列（Column / width）**，在图像中对应横坐标 $x$。
+*   **Y 维度**对应矩阵的**行（Row / height）**，在图像中对应纵坐标 $y$。
+
+根据该约定，定位矩阵元素的坐标计算公式为：
+$$\text{col} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+$$\text{row} = \text{blockIdx.y} \times \text{blockDim.y} + \text{threadIdx.y}$$
+
+从而，该线程对应的**一维线性数组索引**为：
+$$\text{idx} = \text{row} \times \text{width} + \text{col}$$
+
+> **重要提示**：新手极易将 `row` 和 `col` 的计算与 `x`、`y` 搞反。请牢记：**Block/Grid 的 `.x` 对应横向（列数），`.y` 对应纵向（行数）**。
+
+---
+
+### 3. 第三阶段练习题
+**题目要求：**
+编写一个 CUDA 程序，实现两个二维矩阵的相加。
+*   矩阵维度： $A$ 和 $B$ 分别为 $1024 \times 2048$ 的二维矩阵（即 1024 行，2048 列）。
+*   计算 $C[\text{row}][\text{col}] = A[\text{row}][\text{col}] + B[\text{row}][\text{col}]$。
+*   使用 $16 \times 16$ 的二维 Block 组织线程。
+*   编写核函数，处理好边界条件，将结果写回并验证。
+
+---
+
+### 4. 练习题讲解与完整代码
+
+#### 【原理解析】
+对于 $1024 \times 2048$ 的矩阵：
+*   宽度（列数 `width`）= 2048。
+*   高度（行数 `height`）= 1024。
+*   Block 设为 `(16, 16)`，则：
+    *   X 方向（宽度方向）需要： $(2048 + 16 - 1) / 16 = 128$ 个 Block。
+    *   Y 方向（高度方向）需要： $(1024 + 16 - 1) / 16 = 64$ 个 Block。
+    *   总计启动 $128 \times 64 = 8192$ 个 Block。
+
+#### 【完整代码实现】
+
+```cpp
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// 二维矩阵相加核函数
+__global__ void matrixAdd(float *C, const float *A, const float *B, int width, int height) {
+    // 计算当前线程对应的矩阵列(col)和行(row)
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // 边界条件检查（必须在矩阵有效行列范围内）
+    if (row < height && col < width) {
+        // 计算行优先的一维线性索引
+        int idx = row * width + col;
+        C[idx] = A[idx] + B[idx];
+    }
+}
+
+int main() {
+    const int height = 1024; // 行数
+    const int width = 2048;  // 列数
+    const int N = height * width;
+    size_t size = N * sizeof(float);
+
+    // Host 内存分配与初始化
+    float *h_A = new float(N);
+    float *h_B = new float(N);
+    float *h_C = new float(N);
+
+    for (int i = 0; i < N; i++) {
+        h_A[i] = 1.0f;
+        h_B[i] = 2.0f;
+    }
+
+    // Device 显存分配
+    float *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
+    cudaMalloc((void**)&d_A, size);
+    cudaMalloc((void**)&d_B, size);
+    cudaMalloc((void**)&d_C, size);
+
+    // 拷贝数据至 GPU
+    cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+
+    // 定义二维 Block 和 Grid 维度
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (height + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    std::cout << "Grid Dimensions: (" << numBlocks.x << ", " << numBlocks.y << ")" << std::endl;
+    std::cout << "Block Dimensions: (" << threadsPerBlock.x << ", " << threadsPerBlock.y << ")" << std::endl;
+
+    // 启动核函数
+    matrixAdd<<<numBlocks, threadsPerBlock>>>(d_C, d_A, d_B, width, height);
+    cudaDeviceSynchronize();
+
+    // 拷贝结果回 Host
+    cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+
+    // 验证结果
+    bool success = true;
+    for (int i = 0; i < N; i++) {
+        if (std::abs(h_C[i] - 3.0f) > 1e-5) {
+            success = false;
+            std::cout << "Error at flat index " << i << ": expected 3.0, got " << h_C[i] << std::endl;
+            break;
+        }
+    }
+
+    if (success) {
+        std::cout << "Matrix addition verified successfully! C[0][0] = " << h_C[0] << std::endl;
+    }
+
+    // 释放资源
+    delete[] h_A; delete[] h_B; delete[] h_C;
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+
+    return 0;
+}
+```
