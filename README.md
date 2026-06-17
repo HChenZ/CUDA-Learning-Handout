@@ -539,9 +539,9 @@ int main() {
     // 对于 i=5：(4 + 5 + 6)/3 = 5.0
     // 对于 i=999 (最后一个): (998 + 999 + 0)/3 = 665.6666
     std::cout << "Verification:" << std::endl;
-    std::cout << "Output[0]   = " << h_out[0] << " (Expected: " << 1.0f/3.0f << ")" << std::endl;
+    std::cout << "Output[0]   = " << h_out[0] << " (Expected: " << 1.0f / 3.0f << ")" << std::endl;
     std::cout << "Output[5]   = " << h_out[5] << " (Expected: 5.0)" << std::endl;
-    std::cout << "Output[999] = " << h_out[999] << " (Expected: " << (998.0f + 999.0f)/3.0f << ")" << std::endl;
+    std::cout << "Output[999] = " << h_out[999] << " (Expected: " << (998.0f + 999.0f) / 3.0f << ")" << std::endl;
 
     delete[] h_in;
     delete[] h_out;
