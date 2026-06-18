@@ -477,7 +477,8 @@ $$B[i] = \frac{A[i-1] + A[i] + A[i+1]}{3}$$
 
 // 使用模板参数定义 Block 大小，方便在核函数中静态声明共享内存数组大小
 template <int BLOCK_SIZE>
-__global__ void stencil_1D(float *d_out, const float *d_in, int N) {
+__global__ void stencil_1D(float *d_out, const float *d_in, int N)
+{
     // 静态分配共享内存，大小为 BLOCK_SIZE + 2（左右光晕各占1位）
     __shared__ float s_data[BLOCK_SIZE + 2];
 
@@ -507,7 +508,8 @@ __global__ void stencil_1D(float *d_out, const float *d_in, int N) {
         d_out[g_idx] = (s_data[l_idx - 1] + s_data[l_idx] + s_data[l_idx + 1]) / 3.0f;
 }
 
-int main() {
+int main()
+{
     const int N = 1000;
     size_t size = N * sizeof(float);
 
@@ -547,6 +549,190 @@ int main() {
     delete[] h_out;
     cudaFree(d_in);
     cudaFree(d_out);
+
+    return 0;
+}
+```
+
+---
+
+## 第五阶段：线程束（Warp）与并行规约算法
+
+### 1. 核心概念：什么是 Warp（线程束）？
+在 GPU 硬件层面，**流多处理器（SM）** 并不是以单个 Thread 为单位来调度和执行代码的，而是以 **Warp（线程束）** 为单位。
+*   **Warp 的大小**：在目前的 NVIDIA GPU 架构中，**一个 Warp 包含 32 个线程**。
+*   **SIMT（单指令多线程）**：同一个 Warp 中的 32 个线程，在同一时刻只能执行**同一条相同的指令**。它们像仪仗队一样步调完全一致。
+
+#### 线程束分化（Warp Divergence）
+如果你的代码中包含分支控制语句（如 `if-else`），且同一个 Warp 中的一部分线程走 `if` 分支，另一部分走 `else` 分支，就会发生**分支分化**：
+*   硬件会先让走 `if` 的线程执行，而让走 `else` 的线程处于等待（屏蔽）状态。
+*   执行完 `if` 分支后，再让走 `else` 的线程执行，而屏蔽走 `if` 的线程。
+*   这会导致原本应该并行的两条路径变成了**串行执行**，从而使该段代码的执行效率降低。
+
+> **优化黄金法则**：在编写 GPU 代码时，应尽量避免让同一个 Warp 内的 32 个线程走向不同的分支。
+
+---
+
+### 2. 并行规约（Parallel Reduction）
+**规约（Reduction）** 是一种常见的计算模式：输入一个数组（大小为 $N$），通过某种结合律算子（如加法、乘法、最大值、最小值），将其缩减为一个单一的数值。
+
+*   **CPU 的做法**：使用一个循环，时间复杂度为 $O(N)$。
+    ```cpp
+    float sum = 0;
+    for(int i = 0; i < N; ++i) sum += A[i];
+    ```
+*   **GPU 的做法（树状折叠）**：
+    我们将数组数据两两相加。在第 1 步，将数组前半部分与后半部分对应相加（$N/2$ 次并行加法）；第 2 步，再折叠相加……以此类推。时间复杂度降低至 $O(\log N)$。
+
+#### 规约中如何避免 Warp Divergence？
+在进行树状折叠时，我们需要决定“哪些线程参与相加”。
+
+*   **低效方案（交错跨步）**：
+    ```cpp
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        if (threadIdx.x % (2 * stride) == 0) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    ```
+    *问题*：当 `stride = 1` 时，活跃的线程是 0, 2, 4, 6...。这意味着在同一个 Warp（0~31号线程）中，有的线程活跃，有的不活跃，从而导致严重的**分支分化**。
+
+*   **高效方案（连续跨步）**：
+    ```cpp
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    ```
+    *优势*：当 `stride = 128` 时，活跃的线程是 0 ~ 127。这些线程在物理上是完全连续的。前 4 个 Warp（线程 0 ~ 127）完全饱满地在工作，后面的 Warp 完全空闲，从而避免了 Warp 内部的分支分化。
+
+---
+
+### 3. 第五阶段练习题
+**题目要求：**
+编写一个 CUDA 程序，计算一个大小为 $N = 1024$ 的单精度浮点数组的累加和（Sum）。
+
+*   要求使用 **连续跨步（Strided Access）** 的并行规约算法。
+*   使用 4 个 Block，每个 Block 包含 256 个线程。
+*   每个 Block 负责规约自己的 256 个元素，最终输出 4 个中间结果。
+*   将这 4 个中间结果拷贝回 CPU，并在 CPU 上完成最后的累加。
+*   打印结果并与 CPU 串行计算的结果进行比对。
+
+---
+
+### 4. 练习题讲解与完整代码
+
+#### 【算法演进图解】
+假设一个 Block 负责计算其局部的 256 个元素的和，步骤如下：
+1.  将当前 Block 对应的 256 个数据从全局内存载入到大小为 256 的共享内存 `sdata` 中。
+2.  第一次折叠（`stride = 128`）：线程 0~127 活跃，将 `sdata[i]` 与 `sdata[i+128]` 相加，结果存入 `sdata[i]`。同步。
+3.  第二次折叠（`stride = 64`）：线程 0~63 活跃，将 `sdata[i]` 与 `sdata[i+64]` 相加。同步。
+4.  以此类推，直到 `stride = 1`。最终 `sdata[0]` 中保存的就是这个 Block 内 256 个元素的累加和。
+5.  将 `sdata[0]` 写入全局内存的指定槽位 `d_out[blockIdx.x]`。
+
+#### 【完整代码实现】
+
+```cpp
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// 模板参数定义 Block 大小
+template <int BLOCK_SIZE>
+__global__ void blockReduceSum(float *d_out, const float *d_in, int N)
+{
+    // 声明共享内存
+    __shared__ float sdata[BLOCK_SIZE];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 1. 将数据载入共享内存
+    if (gid < N)
+        sdata[tid] = d_in[gid];
+    else
+        sdata[tid] = 0.0f; // 越界部分填充0
+
+    // 确保所有线程都已将数据写入共享内存
+    __syncthreads();
+
+    // 2. 连续跨步规约（避免 Warp Divergence）
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        // 只有小于当前跨步（stride）的线程才保持活跃
+        if (tid < stride)
+            sdata[tid] += sdata[tid + stride];
+        // 每次折叠后必须同步，确保下一轮读取的都是更新后的数据
+        __syncthreads();
+    }
+
+    // 3. 将本 Block 的计算结果写入全局内存
+    if (tid == 0)
+        d_out[blockIdx.x] = sdata[0];
+}
+
+int main()
+{
+    const int N = 1024;
+    const int threadsPerBlock = 256;
+    const int numBlocks = N / threadsPerBlock; // 4 个 Block
+    size_t size_in = N * sizeof(float);
+    size_t size_out = numBlocks * sizeof(float);
+
+    // Host 内存分配
+    float *h_in = new float[N];
+    float *h_block_sums = new float[N];
+
+    // 初始化输入数据，如所有元素初始化为 1.0
+    float cpu_sum = 0.0f;
+    for (int i = 0; i < N; i++)
+    {
+        h_in[i] = 1.0f; 
+        cpu_sum += h_in[i]; // 串行累加用于验证
+    }
+
+    // Device 内存分配
+    float *d_in = nullptr;
+    float *d_block_sums = nullptr;
+    cudaMalloc((void **)&d_in, size_in);
+    cudaMalloc((void **)&d_block_sums, size_out);
+
+    // 拷贝数据至 GPU
+    cudaMemcpy(d_in, h_in, size_in, cudaMemcpyHostToDevice);
+
+    // 启动规约核函数
+    blockReduceSum<threadsPerBlock><<<<numBlocks, threadsPerBlock>>>(d_block_sums, d_in, N);
+    cudaDeviceSynchronize();
+
+    // 将 4 个 Block 的中间结果拷贝回 Host
+    cudaMemcpy(h_block_sums, d_block_sums, size_out, cudaMemcpyDeviceToHost);
+
+    // 在 CPU 上对各个 Block 的中间结果做最后的累加
+    float gpu_sum = 0.0f;
+    for (int i = 0; i < numBlocks; i++)
+    {
+        std::cout << "Block " << i << " sum = " << h_block_sums[i] << std::endl;
+        gpu_sum += h_block_sums[i];
+    }
+
+    // 验证结果
+    std::cout << "\n--- Verification ---" << std::endl;
+    std::cout << "GPU Sum: " << gpu_sum << std::endl;
+    std::cout << "CPU Sum: " << cpu_sum << std::endl;
+
+    if (std::abs(gpu_sum - cpu_sum) < 1e-4)
+        std::cout << "SUCCESS: Results match!" << std::endl;
+    else
+        std::cout << "FAILURE: Results mismatch!" << std::endl;
+
+    // 释放资源
+    delete[] h_in;
+    delete[] h_block_sums;
+    cudaFree(d_in);
+    cudaFree(d_block_sums);
 
     return 0;
 }
